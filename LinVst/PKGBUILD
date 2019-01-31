@@ -1,6 +1,7 @@
 pkgname=linvst-bin
 pkgver=2.4.1
 pkgrel=1
+provides=('linvst')
 conflicts=('linvst')
 
 _pkgname=LinVst-$pkgver-Debian-Stretch
