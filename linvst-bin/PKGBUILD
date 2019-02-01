@@ -17,8 +17,8 @@ source=("https://github.com/osxmidi/LinVst/releases/download/2.4/${_pkgname}.zip
 sha256sums=('1a722c313b0e4b95a32e6589bbcd96582a23a44ba19f49fd6917edc6fea6fc91')
 
 package() {
-	mkdir -p "${pkgdir}/usr/bin"
-	cp "${srcdir}/${_pkgname}/embedded-version/lin-vst-server"* "${pkgdir}/usr/bin/"
-	install -Dm 644 "${srcdir}/${_pkgname}/embedded-version/linvst.so" "${pkgdir}/usr/lib/vst/linvst.so"
+	install -d "${pkgdir}/usr/bin"
+	install -m 644 "${srcdir}/${_pkgname}/embedded-version/lin-vst-server"* "${pkgdir}/usr/bin/"
+	install -Dm 644 "${srcdir}/${_pkgname}/embedded-version/linvst.so" "${pkgdir}/usr/share/LinVst/linvst.so"
 	install -Dm 755 "${srcdir}/${_pkgname}/convert/linvstconvert" "${pkgdir}/usr/bin/linvstconvert"
 }
