@@ -1,11 +1,11 @@
-pkgname=linvst
+pkgname=linvst-stable
 pkgver=2.4
 pkgrel=1
 
 _pkgname=LinVst
 
 provides=('linvst')
-conflicts=('linvst-git' 'linvst-bin')
+conflicts=('linvst' 'linvst-git' 'linvst-bin')
 
 pkgdesc="Bridge that allows Windows vst's to be used as Linux vst's in Linux vst capable DAW's"
 url="https://github.com/osxmidi/LinVst"
