@@ -1,6 +1,6 @@
 pkgname=linvst-stable
 pkgver=2.4
-pkgrel=1
+pkgrel=2
 provides=('linvst')
 conflicts=('linvst')
 pkgdesc="Bridge that allows Windows vst's to be used as Linux vst's in Linux vst capable DAW's"
@@ -21,13 +21,13 @@ build() {
 	cd "${srcdir}/${_pkgname}-${pkgver}"
 	make -f Makefile-embed-6432 DESTDIR="${pkgdir}" all
 	cd "convert"
-	sh makegtk3
-	sh makegtk3tree
+	bash makegtk3
+	bash makegtk3tree
 }
 
 package() {
 	cd "${srcdir}/${_pkgname}-${pkgver}"
-	make -f Makefile-embed-6432 DESTDIR="${pkgdir}" VST_DIR="${pkgdir}/usr/share/${_pkgname}"  install
+	make -f Makefile-embed-6432 DESTDIR="${pkgdir}" VST_DIR="${pkgdir}/usr/share/linvst"  install
 	install -m 755 "convert/linvstconvert" "${pkgdir}/usr/bin/"
 	install -m 755 "convert/linvstconverttree" "${pkgdir}/usr/bin/"
 }
