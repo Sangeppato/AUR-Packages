@@ -1,2 +1,2 @@
-# arch-packages
+# Arch-packages
 some PKGBUILDs
