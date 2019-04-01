@@ -1,2 +1,2 @@
 # AUR-Packages
-some PKGBUILD for AUR
+some PKGBUILD
