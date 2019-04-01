@@ -1,2 +1,2 @@
-# AUR-Packages
-some PKGBUILD
+# arch-packages
+some PKGBUILDs
