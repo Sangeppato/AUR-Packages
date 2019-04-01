@@ -2,6 +2,9 @@
 # Maintainer: Ionut Biru <ibiru@archlinux.org>
 # Contributor: Michael Kanis <mkanis_at_gmx_dot_de>
 
+# This PKGBUILD merges https://gitlab.gnome.org/GNOME/mutter/merge_requests/506 into master
+# All credit goes to Tim Summerer
+
 pkgname=mutter
 pkgver=3.32.0+45+g718e7a76e
 pkgrel=1
@@ -18,9 +21,9 @@ groups=(gnome)
 _commit=9d49e8abd077941b126685dde3b64753cc4fc916  # master
 source=("git+https://gitlab.gnome.org/GNOME/mutter.git#commit=$_commit"
         216.patch)
-#options=(!strip debug)
 sha256sums=('SKIP'
             'SKIP')
+#options=(!strip debug)   #enable debug
 
 pkgver() {
   cd $pkgname
@@ -30,8 +33,9 @@ pkgver() {
 prepare() {
   cd $pkgname
 
+  # https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
   git fetch https://gitlab.gnome.org/jadahl/mutter.git wip/kms-power-save-race
-  git checkout -f -b jadahl/mutter-wip/kms-power-save-race FETCH_HEAD
+  git checkout -b jadahl/mutter-wip/kms-power-save-race FETCH_HEAD
   git fetch origin
   git checkout origin/master
   git merge --no-ff jadahl/mutter-wip/kms-power-save-race 
