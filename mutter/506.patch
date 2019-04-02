@@ -1,0 +1,978 @@
+From afb24d88d280f1a766f5f1240fb435b49b7a1ed4 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Fri, 11 Jan 2019 14:45:44 +0100
+Subject: [PATCH 1/6] monitor-manager: Clean up DPMS state tracking
+
+DPMS is configured from a bit all over the place: via D-Bus, via X11 and
+when reading the current KMS state. Each of these places did it slightly
+differently, directly poking at the field in MetaMonitorManager.
+
+To make things a bit more managable, move the field into a new
+MetaMonitorManagerPrivate, and add helpers to get and set the current
+value. Prior to this, there were for example situations where the DPMS
+setting was changed, but without signal listeners being notified about
+it.
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/meta-input-settings.c            |  4 +-
+ src/backends/meta-monitor-manager-private.h   |  9 +++-
+ src/backends/meta-monitor-manager.c           | 53 ++++++++++++++++---
+ src/backends/native/meta-gpu-kms.c            |  9 ++--
+ .../native/meta-monitor-manager-kms.c         | 16 ++++++
+ src/backends/x11/meta-gpu-xrandr.c            | 32 -----------
+ .../x11/meta-monitor-manager-xrandr.c         | 45 ++++++++++++++++
+ 7 files changed, 120 insertions(+), 48 deletions(-)
+
+diff --git a/src/backends/meta-input-settings.c b/src/backends/meta-input-settings.c
+index 27e99b574..7b8df561a 100644
+--- a/src/backends/meta-input-settings.c
++++ b/src/backends/meta-input-settings.c
+@@ -1766,9 +1766,11 @@ power_save_mode_changed_cb (MetaMonitorManager *manager,
+   ClutterInputDevice *device;
+   MetaLogicalMonitor *logical_monitor;
+   MetaMonitor *builtin;
++  MetaPowerSave power_save_mode;
+   gboolean on;
+ 
+-  on = (manager->power_save_mode == META_POWER_SAVE_ON);
++  power_save_mode = meta_monitor_manager_get_power_save_mode (manager);
++  on = power_save_mode == META_POWER_SAVE_ON;
+   priv = meta_input_settings_get_instance_private (user_data);
+ 
+   builtin = meta_monitor_manager_get_laptop_panel (manager);
+diff --git a/src/backends/meta-monitor-manager-private.h b/src/backends/meta-monitor-manager-private.h
+index 3b951c64c..cdb8f4209 100644
+--- a/src/backends/meta-monitor-manager-private.h
++++ b/src/backends/meta-monitor-manager-private.h
+@@ -116,8 +116,6 @@ struct _MetaMonitorManager
+   gboolean in_init;
+   unsigned int serial;
+ 
+-  MetaPowerSave power_save_mode;
+-
+   MetaLogicalMonitorLayoutMode layout_mode;
+ 
+   int screen_width;
+@@ -192,6 +190,8 @@ struct _MetaMonitorManagerClass
+   GBytes* (*read_edid) (MetaMonitorManager *,
+                         MetaOutput         *);
+ 
++  void (*read_current_state) (MetaMonitorManager *);
++
+   void (*ensure_initial_config) (MetaMonitorManager *);
+ 
+   gboolean (*apply_monitors_config) (MetaMonitorManager      *,
+@@ -305,6 +305,11 @@ void                meta_monitor_manager_get_screen_size   (MetaMonitorManager *
+                                                             int                *width,
+                                                             int                *height);
+ 
++MetaPowerSave       meta_monitor_manager_get_power_save_mode (MetaMonitorManager *manager);
++
++void                meta_monitor_manager_power_save_mode_changed (MetaMonitorManager *manager,
++                                                                  MetaPowerSave       mode);
++
+ void                meta_monitor_manager_confirm_configuration (MetaMonitorManager *manager,
+                                                                 gboolean            ok);
+ 
+diff --git a/src/backends/meta-monitor-manager.c b/src/backends/meta-monitor-manager.c
+index c4ed24522..2d898c757 100644
+--- a/src/backends/meta-monitor-manager.c
++++ b/src/backends/meta-monitor-manager.c
+@@ -95,7 +95,13 @@ static gfloat transform_matrices[][6] = {
+ 
+ static int signals[SIGNALS_LAST];
+ 
+-G_DEFINE_TYPE (MetaMonitorManager, meta_monitor_manager, G_TYPE_OBJECT)
++typedef struct _MetaMonitorManagerPrivate
++{
++  MetaPowerSave power_save_mode;
++} MetaMonitorManagerPrivate;
++
++G_DEFINE_TYPE_WITH_PRIVATE (MetaMonitorManager, meta_monitor_manager,
++                            G_TYPE_OBJECT)
+ 
+ static void initialize_dbus_interface (MetaMonitorManager *manager);
+ static void monitor_manager_setup_dbus_config_handlers (MetaMonitorManager *manager);
+@@ -107,6 +113,9 @@ meta_monitor_manager_is_config_complete (MetaMonitorManager *manager,
+ static MetaMonitor *
+ meta_monitor_manager_get_active_monitor (MetaMonitorManager *manager);
+ 
++static void
++meta_monitor_manager_real_read_current_state (MetaMonitorManager *manager);
++
+ MetaBackend *
+ meta_monitor_manager_get_backend (MetaMonitorManager *manager)
+ {
+@@ -329,11 +338,24 @@ meta_monitor_manager_rebuild_logical_monitors_derived (MetaMonitorManager *manag
+                                                     primary_logical_monitor);
+ }
+ 
++void
++meta_monitor_manager_power_save_mode_changed (MetaMonitorManager *manager,
++                                              MetaPowerSave       mode)
++{
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
++
++  priv->power_save_mode = mode;
++  g_signal_emit (manager, signals[POWER_SAVE_MODE_CHANGED], 0);
++}
++
+ static void
+ power_save_mode_changed (MetaMonitorManager *manager,
+                          GParamSpec         *pspec,
+                          gpointer            user_data)
+ {
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
+   MetaMonitorManagerClass *klass;
+   int mode = meta_dbus_display_config_get_power_save_mode (manager->display_config);
+ 
+@@ -341,7 +363,7 @@ power_save_mode_changed (MetaMonitorManager *manager,
+     return;
+ 
+   /* If DPMS is unsupported, force the property back. */
+-  if (manager->power_save_mode == META_POWER_SAVE_UNSUPPORTED)
++  if (priv->power_save_mode == META_POWER_SAVE_UNSUPPORTED)
+     {
+       meta_dbus_display_config_set_power_save_mode (manager->display_config, META_POWER_SAVE_UNSUPPORTED);
+       return;
+@@ -351,9 +373,7 @@ power_save_mode_changed (MetaMonitorManager *manager,
+   if (klass->set_power_save_mode)
+     klass->set_power_save_mode (manager, mode);
+ 
+-  manager->power_save_mode = mode;
+-
+-  g_signal_emit (manager, signals[POWER_SAVE_MODE_CHANGED], 0);
++  meta_monitor_manager_power_save_mode_changed (manager, mode);
+ }
+ 
+ void
+@@ -855,6 +875,7 @@ meta_monitor_manager_class_init (MetaMonitorManagerClass *klass)
+   object_class->set_property = meta_monitor_manager_set_property;
+ 
+   klass->read_edid = meta_monitor_manager_real_read_edid;
++  klass->read_current_state = meta_monitor_manager_real_read_current_state;
+ 
+   signals[MONITORS_CHANGED] =
+     g_signal_new ("monitors-changed",
+@@ -2684,6 +2705,15 @@ meta_monitor_manager_get_screen_size (MetaMonitorManager *manager,
+   *height = manager->screen_height;
+ }
+ 
++MetaPowerSave
++meta_monitor_manager_get_power_save_mode (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerPrivate *priv =
++    meta_monitor_manager_get_instance_private (manager);
++
++  return priv->power_save_mode;
++}
++
+ static void
+ rebuild_monitors (MetaMonitorManager *manager)
+ {
+@@ -2760,8 +2790,8 @@ meta_monitor_manager_is_transform_handled (MetaMonitorManager  *manager,
+   return manager_class->is_transform_handled (manager, crtc, transform);
+ }
+ 
+-void
+-meta_monitor_manager_read_current_state (MetaMonitorManager *manager)
++static void
++meta_monitor_manager_real_read_current_state (MetaMonitorManager *manager)
+ {
+   GList *l;
+ 
+@@ -2782,6 +2812,15 @@ meta_monitor_manager_read_current_state (MetaMonitorManager *manager)
+   rebuild_monitors (manager);
+ }
+ 
++void
++meta_monitor_manager_read_current_state (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerClass *manager_class =
++    META_MONITOR_MANAGER_GET_CLASS (manager);
++
++  manager_class->read_current_state (manager);
++}
++
+ static void
+ meta_monitor_manager_notify_monitors_changed (MetaMonitorManager *manager)
+ {
+diff --git a/src/backends/native/meta-gpu-kms.c b/src/backends/native/meta-gpu-kms.c
+index d924466f8..c569b948e 100644
+--- a/src/backends/native/meta-gpu-kms.c
++++ b/src/backends/native/meta-gpu-kms.c
+@@ -210,7 +210,7 @@ meta_gpu_kms_is_crtc_active (MetaGpuKms *gpu_kms,
+ 
+   g_assert (meta_crtc_get_gpu (crtc) == META_GPU (gpu_kms));
+ 
+-  if (monitor_manager->power_save_mode != META_POWER_SAVE_ON)
++  if (meta_monitor_manager_get_power_save_mode (monitor_manager))
+     return FALSE;
+ 
+   connected_crtc_found = FALSE;
+@@ -273,7 +273,8 @@ meta_gpu_kms_flip_crtc (MetaGpuKms  *gpu_kms,
+   int ret = -1;
+ 
+   g_assert (meta_crtc_get_gpu (crtc) == gpu);
+-  g_assert (monitor_manager->power_save_mode == META_POWER_SAVE_ON);
++  g_assert (meta_monitor_manager_get_power_save_mode (monitor_manager) ==
++            META_POWER_SAVE_ON);
+ 
+   get_crtc_drm_connectors (gpu, crtc, &connectors, &n_connectors);
+   g_assert (n_connectors > 0);
+@@ -836,8 +837,6 @@ meta_gpu_kms_read_current (MetaGpu  *gpu,
+                            GError  **error)
+ {
+   MetaGpuKms *gpu_kms = META_GPU_KMS (gpu);
+-  MetaMonitorManager *monitor_manager =
+-    meta_gpu_get_monitor_manager (gpu);
+   MetaKmsResources resources;
+   g_autoptr (GError) local_error = NULL;
+ 
+@@ -855,8 +854,6 @@ meta_gpu_kms_read_current (MetaGpu  *gpu,
+   gpu_kms->max_buffer_width = resources.resources->max_width;
+   gpu_kms->max_buffer_height = resources.resources->max_height;
+ 
+-  monitor_manager->power_save_mode = META_POWER_SAVE_ON;
+-
+   /* Note: we must not free the public structures (output, crtc, monitor
+      mode and monitor info) here, they must be kept alive until the API
+      users are done with them after we emit monitors-changed, and thus
+diff --git a/src/backends/native/meta-monitor-manager-kms.c b/src/backends/native/meta-monitor-manager-kms.c
+index c9a3cabe2..9a0364441 100644
+--- a/src/backends/native/meta-monitor-manager-kms.c
++++ b/src/backends/native/meta-monitor-manager-kms.c
+@@ -108,6 +108,21 @@ meta_monitor_manager_kms_read_edid (MetaMonitorManager *manager,
+   return meta_output_kms_read_edid (output);
+ }
+ 
++static void
++meta_monitor_manager_kms_read_current_state (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerClass *parent_class =
++    META_MONITOR_MANAGER_CLASS (meta_monitor_manager_kms_parent_class);
++  MetaPowerSave power_save_mode;
++
++  power_save_mode = meta_monitor_manager_get_power_save_mode (manager);
++  if (power_save_mode != META_POWER_SAVE_ON)
++    meta_monitor_manager_power_save_mode_changed (manager,
++                                                  META_POWER_SAVE_ON);
++
++  parent_class->read_current_state (manager);
++}
++
+ static void
+ meta_monitor_manager_kms_set_power_save_mode (MetaMonitorManager *manager,
+                                               MetaPowerSave       mode)
+@@ -755,6 +770,7 @@ meta_monitor_manager_kms_class_init (MetaMonitorManagerKmsClass *klass)
+   object_class->dispose = meta_monitor_manager_kms_dispose;
+ 
+   manager_class->read_edid = meta_monitor_manager_kms_read_edid;
++  manager_class->read_current_state = meta_monitor_manager_kms_read_current_state;
+   manager_class->ensure_initial_config = meta_monitor_manager_kms_ensure_initial_config;
+   manager_class->apply_monitors_config = meta_monitor_manager_kms_apply_monitors_config;
+   manager_class->set_power_save_mode = meta_monitor_manager_kms_set_power_save_mode;
+diff --git a/src/backends/x11/meta-gpu-xrandr.c b/src/backends/x11/meta-gpu-xrandr.c
+index 14b46d530..3e8a7318d 100644
+--- a/src/backends/x11/meta-gpu-xrandr.c
++++ b/src/backends/x11/meta-gpu-xrandr.c
+@@ -97,8 +97,6 @@ meta_gpu_xrandr_read_current (MetaGpu  *gpu,
+   GList *l;
+   int min_width, min_height;
+   Screen *screen;
+-  BOOL dpms_capable, dpms_enabled;
+-  CARD16 dpms_state;
+   GList *outputs = NULL;
+   GList *modes = NULL;
+   GList *crtcs = NULL;
+@@ -107,36 +105,6 @@ meta_gpu_xrandr_read_current (MetaGpu  *gpu,
+     XRRFreeScreenResources (gpu_xrandr->resources);
+   gpu_xrandr->resources = NULL;
+ 
+-  dpms_capable = DPMSCapable (xdisplay);
+-
+-  if (dpms_capable &&
+-      DPMSInfo (xdisplay, &dpms_state, &dpms_enabled) &&
+-      dpms_enabled)
+-    {
+-      switch (dpms_state)
+-        {
+-        case DPMSModeOn:
+-          monitor_manager->power_save_mode = META_POWER_SAVE_ON;
+-          break;
+-        case DPMSModeStandby:
+-          monitor_manager->power_save_mode = META_POWER_SAVE_STANDBY;
+-          break;
+-        case DPMSModeSuspend:
+-          monitor_manager->power_save_mode = META_POWER_SAVE_SUSPEND;
+-          break;
+-        case DPMSModeOff:
+-          monitor_manager->power_save_mode = META_POWER_SAVE_OFF;
+-          break;
+-        default:
+-          monitor_manager->power_save_mode = META_POWER_SAVE_UNSUPPORTED;
+-          break;
+-        }
+-    }
+-  else
+-    {
+-      monitor_manager->power_save_mode = META_POWER_SAVE_UNSUPPORTED;
+-    }
+-
+   XRRGetScreenSizeRange (xdisplay, DefaultRootWindow (xdisplay),
+                          &min_width,
+                          &min_height,
+diff --git a/src/backends/x11/meta-monitor-manager-xrandr.c b/src/backends/x11/meta-monitor-manager-xrandr.c
+index 784bbde7c..45c81f4eb 100644
+--- a/src/backends/x11/meta-monitor-manager-xrandr.c
++++ b/src/backends/x11/meta-monitor-manager-xrandr.c
+@@ -121,6 +121,50 @@ meta_monitor_manager_xrandr_read_edid (MetaMonitorManager *manager,
+   return meta_output_xrandr_read_edid (output);
+ }
+ 
++static MetaPowerSave
++x11_dpms_state_to_power_save (CARD16 dpms_state)
++{
++  switch (dpms_state)
++    {
++    case DPMSModeOn:
++      return META_POWER_SAVE_ON;
++    case DPMSModeStandby:
++      return META_POWER_SAVE_STANDBY;
++    case DPMSModeSuspend:
++      return META_POWER_SAVE_SUSPEND;
++    case DPMSModeOff:
++      return META_POWER_SAVE_OFF;
++    default:
++      return META_POWER_SAVE_UNSUPPORTED;
++    }
++}
++
++static void
++meta_monitor_manager_xrandr_read_current_state (MetaMonitorManager *manager)
++{
++  MetaMonitorManagerXrandr *manager_xrandr =
++    META_MONITOR_MANAGER_XRANDR (manager);
++  MetaMonitorManagerClass *parent_class =
++    META_MONITOR_MANAGER_CLASS (meta_monitor_manager_xrandr_parent_class);
++  Display *xdisplay = meta_monitor_manager_xrandr_get_xdisplay (manager_xrandr);
++  BOOL dpms_capable, dpms_enabled;
++  CARD16 dpms_state;
++  MetaPowerSave power_save_mode;
++
++  dpms_capable = DPMSCapable (xdisplay);
++
++  if (dpms_capable &&
++      DPMSInfo (xdisplay, &dpms_state, &dpms_enabled) &&
++      dpms_enabled)
++    power_save_mode = x11_dpms_state_to_power_save (dpms_state);
++  else
++    power_save_mode = META_POWER_SAVE_UNSUPPORTED;
++
++  meta_monitor_manager_power_save_mode_changed (manager, power_save_mode);
++
++  parent_class->read_current_state (manager);
++}
++
+ static void
+ meta_monitor_manager_xrandr_set_power_save_mode (MetaMonitorManager *manager,
+ 						 MetaPowerSave       mode)
+@@ -1046,6 +1090,7 @@ meta_monitor_manager_xrandr_class_init (MetaMonitorManagerXrandrClass *klass)
+   object_class->constructed = meta_monitor_manager_xrandr_constructed;
+ 
+   manager_class->read_edid = meta_monitor_manager_xrandr_read_edid;
++  manager_class->read_current_state = meta_monitor_manager_xrandr_read_current_state;
+   manager_class->ensure_initial_config = meta_monitor_manager_xrandr_ensure_initial_config;
+   manager_class->apply_monitors_config = meta_monitor_manager_xrandr_apply_monitors_config;
+   manager_class->set_power_save_mode = meta_monitor_manager_xrandr_set_power_save_mode;
+-- 
+2.18.1
+
+
+From 1bee630959dc1c575b81d02e68b18078e03c942c Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Fri, 22 Mar 2019 18:54:20 +0100
+Subject: [PATCH 2/6] renderer-native: Fix page flip retry timeout calculation
+
+It tried to add a (implicitly casted) float to a uint64_t, and due to
+floating point precision issues resulted in timestamps intended to be
+in the future to actually be in the past. Fix this by first casting the
+delay to an uint64_t, then add it to the time stamp.
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/native/meta-renderer-native.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index e030e9518..d0de9d0d0 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -1576,7 +1576,7 @@ retry_page_flips (gpointer user_data)
+           g_error_matches (error, G_IO_ERROR, G_IO_ERROR_BUSY))
+         {
+           retry_page_flip_data->retry_time_us +=
+-            G_USEC_PER_SEC / crtc->current_mode->refresh_rate;
++            (uint64_t) (G_USEC_PER_SEC / crtc->current_mode->refresh_rate);
+           l = l_next;
+           continue;
+         }
+@@ -1660,7 +1660,7 @@ schedule_retry_page_flip (MetaOnscreenNative *onscreen_native,
+ 
+   now_us = g_get_monotonic_time ();
+   retry_time_us =
+-    now_us + (G_USEC_PER_SEC / crtc->current_mode->refresh_rate);
++    now_us + (uint64_t) (G_USEC_PER_SEC / crtc->current_mode->refresh_rate);
+ 
+   retry_page_flip_data = g_new0 (RetryPageFlipData, 1);
+   retry_page_flip_data->crtc = crtc;
+-- 
+2.18.1
+
+
+From cf87f949c8d19df90f90a58a5c5f58ab089bd853 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Mon, 25 Mar 2019 10:19:21 +0100
+Subject: [PATCH 3/6] renderer-native: Fake page flipped if power saving when
+ retrying
+
+When we're in a page-flip retry loop due to the FIFO being full
+(drmModePageFlip() failing with EBUSY), we should not continue to try
+when starting to power save, as that means we're blocking new frames,
+which itself blocks input events due to them being compressed using the
+frame clock.
+
+We'd also hit an assert assuming we only try to page flip when not power
+saving.
+
+Thus, fake we flipped if we ended up reaching a power saving state while
+retrying.
+
+Fixes: https://gitlab.gnome.org/GNOME/mutter/issues/509
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/native/meta-renderer-native.c | 51 +++++++++++++++++-----
+ 1 file changed, 40 insertions(+), 11 deletions(-)
+
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index d0de9d0d0..e550a47e7 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -1541,14 +1541,39 @@ retry_page_flip_data_free (RetryPageFlipData *retry_page_flip_data)
+   g_free (retry_page_flip_data);
+ }
+ 
++static void
++retry_page_flip_data_fake_flipped (RetryPageFlipData  *retry_page_flip_data,
++                                   MetaOnscreenNative *onscreen_native)
++{
++  MetaCrtc *crtc = retry_page_flip_data->crtc;
++  MetaGpuKms *gpu_kms = META_GPU_KMS (meta_crtc_get_gpu (crtc));
++
++  if (gpu_kms != onscreen_native->render_gpu)
++    {
++      MetaOnscreenNativeSecondaryGpuState *secondary_gpu_state;
++
++      secondary_gpu_state =
++        meta_onscreen_native_get_secondary_gpu_state (onscreen_native,
++                                                      gpu_kms);
++      secondary_gpu_state->pending_flips--;
++    }
++
++  onscreen_native->total_pending_flips--;
++}
++
+ static gboolean
+ retry_page_flips (gpointer user_data)
+ {
+   MetaOnscreenNative *onscreen_native = user_data;
++  MetaRendererNative *renderer_native = onscreen_native->renderer_native;
++  MetaMonitorManager *monitor_manager =
++    META_MONITOR_MANAGER (renderer_native->monitor_manager_kms);
+   uint64_t now_us;
++  MetaPowerSave power_save_mode;
+   GList *l;
+ 
+   now_us = g_source_get_time (onscreen_native->retry_page_flips_source);
++  power_save_mode = meta_monitor_manager_get_power_save_mode (monitor_manager);
+ 
+   l = onscreen_native->pending_page_flip_retries;
+   while (l)
+@@ -1560,6 +1585,19 @@ retry_page_flips (gpointer user_data)
+       g_autoptr (GError) error = NULL;
+       gboolean did_flip;
+ 
++      if (power_save_mode != META_POWER_SAVE_ON)
++        {
++          onscreen_native->pending_page_flip_retries =
++            g_list_remove_link (onscreen_native->pending_page_flip_retries, l);
++
++          retry_page_flip_data_fake_flipped (retry_page_flip_data,
++                                             onscreen_native);
++          retry_page_flip_data_free (retry_page_flip_data);
++
++          l = l_next;
++          continue;
++        }
++
+       if (is_timestamp_earlier_than (now_us,
+                                      retry_page_flip_data->retry_time_us))
+         {
+@@ -1591,17 +1629,8 @@ retry_page_flips (gpointer user_data)
+                                 G_IO_ERROR_PERMISSION_DENIED))
+             g_critical ("Failed to page flip: %s", error->message);
+ 
+-          if (gpu_kms != onscreen_native->render_gpu)
+-            {
+-              MetaOnscreenNativeSecondaryGpuState *secondary_gpu_state;
+-
+-              secondary_gpu_state =
+-                meta_onscreen_native_get_secondary_gpu_state (onscreen_native,
+-                                                              gpu_kms);
+-              secondary_gpu_state->pending_flips--;
+-            }
+-
+-          onscreen_native->total_pending_flips--;
++          retry_page_flip_data_fake_flipped (retry_page_flip_data,
++                                             onscreen_native);
+         }
+ 
+       retry_page_flip_data_free (retry_page_flip_data);
+-- 
+2.18.1
+
+
+From 65859efc9224ef5440ed256e0a754c2ad4dbad59 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Mon, 25 Mar 2019 10:24:46 +0100
+Subject: [PATCH 4/6] renderer-native: Fake page flipping slower when power
+ saving
+
+We rely on the frame clock to compress input events, thus if the frame
+clock stops, input events are not dispatched. At the same time, there
+is no reason to redraw at a full frame rate, as nothing will be
+presented anyway, so slow down to 10Hz (compared to the most common
+60Hz). Note that we'll only actually reach 10Hz if there is an active
+animation being displayed, which won't happen e.g. if there is a screen
+shield in the way.
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/meta-backend.c                |  2 +-
+ src/backends/meta-stage-private.h          |  3 +-
+ src/backends/meta-stage.c                  | 27 +++++-
+ src/backends/native/meta-renderer-native.c | 99 +++++++++++++++++-----
+ 4 files changed, 102 insertions(+), 29 deletions(-)
+
+diff --git a/src/backends/meta-backend.c b/src/backends/meta-backend.c
+index c527114be..58eec8c94 100644
+--- a/src/backends/meta-backend.c
++++ b/src/backends/meta-backend.c
+@@ -475,7 +475,7 @@ meta_backend_real_post_init (MetaBackend *backend)
+   MetaBackendPrivate *priv = meta_backend_get_instance_private (backend);
+   ClutterDeviceManager *device_manager = clutter_device_manager_get_default ();
+ 
+-  priv->stage = meta_stage_new ();
++  priv->stage = meta_stage_new (backend);
+   clutter_actor_realize (priv->stage);
+   META_BACKEND_GET_CLASS (backend)->select_stage_events (backend);
+ 
+diff --git a/src/backends/meta-stage-private.h b/src/backends/meta-stage-private.h
+index 21feab3ac..639d2372c 100644
+--- a/src/backends/meta-stage-private.h
++++ b/src/backends/meta-stage-private.h
+@@ -23,12 +23,13 @@
+ #include "backends/meta-cursor.h"
+ #include "meta/boxes.h"
+ #include "meta/meta-stage.h"
++#include "meta/types.h"
+ 
+ G_BEGIN_DECLS
+ 
+ typedef struct _MetaOverlay    MetaOverlay;
+ 
+-ClutterActor     *meta_stage_new                     (void);
++ClutterActor     *meta_stage_new                     (MetaBackend *backend);
+ 
+ MetaOverlay      *meta_stage_create_cursor_overlay   (MetaStage   *stage);
+ void              meta_stage_remove_cursor_overlay   (MetaStage   *stage,
+diff --git a/src/backends/meta-stage.c b/src/backends/meta-stage.c
+index 1f0d9c050..47a00e51a 100644
+--- a/src/backends/meta-stage.c
++++ b/src/backends/meta-stage.c
+@@ -180,6 +180,15 @@ meta_stage_deactivate (ClutterStage *actor)
+   stage->is_active = FALSE;
+ }
+ 
++static void
++on_power_save_changed (MetaMonitorManager *monitor_manager,
++                       MetaStage          *stage)
++{
++  if (meta_monitor_manager_get_power_save_mode (monitor_manager) ==
++      META_POWER_SAVE_ON)
++    clutter_actor_queue_redraw (CLUTTER_ACTOR (stage));
++}
++
+ static void
+ meta_stage_class_init (MetaStageClass *klass)
+ {
+@@ -209,11 +218,21 @@ meta_stage_init (MetaStage *stage)
+ }
+ 
+ ClutterActor *
+-meta_stage_new (void)
++meta_stage_new (MetaBackend *backend)
+ {
+-  return g_object_new (META_TYPE_STAGE,
+-                       "cursor-visible", FALSE,
+-                       NULL);
++  MetaStage *stage;
++  MetaMonitorManager *monitor_manager;
++
++  stage = g_object_new (META_TYPE_STAGE,
++                        "cursor-visible", FALSE,
++                        NULL);
++
++  monitor_manager = meta_backend_get_monitor_manager (backend);
++  g_signal_connect (monitor_manager, "power-save-mode-changed",
++                    G_CALLBACK (on_power_save_changed),
++                    stage);
++
++  return CLUTTER_ACTOR (stage);
+ }
+ 
+ static void
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index e550a47e7..0f0992cbf 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -213,6 +213,9 @@ struct _MetaRendererNative
+ 
+   int64_t frame_counter;
+   gboolean pending_unset_disabled_crtcs;
++
++  GList *power_save_page_flip_closures;
++  guint power_save_page_flip_source_id;
+ };
+ 
+ static void
+@@ -1526,6 +1529,38 @@ is_timestamp_earlier_than (uint64_t ts1,
+     return ts2 - ts1 < UINT64_MAX / 2;
+ }
+ 
++static gboolean
++dummy_power_save_page_flip_cb (gpointer user_data)
++{
++  MetaRendererNative *renderer_native = user_data;
++
++  g_list_free_full (renderer_native->power_save_page_flip_closures,
++                    (GDestroyNotify) g_closure_unref);
++  renderer_native->power_save_page_flip_closures = NULL;
++  renderer_native->power_save_page_flip_source_id = 0;
++
++  return G_SOURCE_REMOVE;
++}
++
++static void
++queue_dummy_power_save_page_flip (MetaRendererNative *renderer_native,
++                                  GClosure           *flip_closure)
++{
++  const unsigned int timeout_ms = 100;
++
++  if (!renderer_native->power_save_page_flip_source_id)
++    {
++      renderer_native->power_save_page_flip_source_id =
++        g_timeout_add (timeout_ms,
++                       dummy_power_save_page_flip_cb,
++                       renderer_native);
++    }
++
++  renderer_native->power_save_page_flip_closures =
++    g_list_prepend (renderer_native->power_save_page_flip_closures,
++                    g_closure_ref (flip_closure));
++}
++
+ typedef struct _RetryPageFlipData
+ {
+   MetaCrtc *crtc;
+@@ -1748,12 +1783,8 @@ meta_onscreen_native_flip_crtc (CoglOnscreen  *onscreen,
+   uint32_t fb_id;
+ 
+   gpu_kms = META_GPU_KMS (meta_crtc_get_gpu (crtc));
+-  if (!meta_gpu_kms_is_crtc_active (gpu_kms, crtc))
+-    {
+-      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+-                   "Tried to flip inactive CRTC");
+-      return FALSE;
+-    }
++
++  g_assert (meta_gpu_kms_is_crtc_active (gpu_kms, crtc));
+ 
+   renderer_gpu_data = meta_renderer_native_get_gpu_data (renderer_native,
+                                                          render_gpu);
+@@ -1994,7 +2025,11 @@ meta_onscreen_native_flip_crtcs (CoglOnscreen *onscreen)
+   CoglOnscreenEGL *onscreen_egl = onscreen->winsys;
+   MetaOnscreenNative *onscreen_native = onscreen_egl->platform;
+   MetaRendererView *view = onscreen_native->view;
++  MetaRendererNative *renderer_native = onscreen_native->renderer_native;
++  MetaMonitorManager *monitor_manager =
++    META_MONITOR_MANAGER (renderer_native->monitor_manager_kms);
+   GClosure *flip_closure;
++  MetaPowerSave power_save_mode;
+   MetaLogicalMonitor *logical_monitor;
+ 
+   /*
+@@ -2012,23 +2047,28 @@ meta_onscreen_native_flip_crtcs (CoglOnscreen *onscreen)
+                                  (GClosureNotify) flip_closure_destroyed);
+   g_closure_set_marshal (flip_closure, meta_marshal_VOID__OBJECT_OBJECT_INT64);
+ 
+-  /* Either flip the CRTC's of the monitor info, if we are drawing just part
+-   * of the stage, or all of the CRTC's if we are drawing the whole stage.
+-   */
+-  FlipCrtcData data = {
+-    .onscreen = onscreen,
+-    .flip_closure = flip_closure,
+-  };
+-  logical_monitor = meta_renderer_view_get_logical_monitor (view);
+-  meta_logical_monitor_foreach_crtc (logical_monitor, flip_crtc, &data);
++  power_save_mode = meta_monitor_manager_get_power_save_mode (monitor_manager);
++  if (power_save_mode == META_POWER_SAVE_ON)
++    {
++      FlipCrtcData data = {
++        .onscreen = onscreen,
++        .flip_closure = flip_closure,
++      };
++      logical_monitor = meta_renderer_view_get_logical_monitor (view);
++      meta_logical_monitor_foreach_crtc (logical_monitor, flip_crtc, &data);
+ 
+-  /*
+-   * If we didn't queue a page flip, but instead directly changed the mode due
+-   * to the driver not supporting mode setting, wes must swap the buffers
+-   * directly as we won't get a page flip callback.
+-   */
+-  if (!data.did_flip && data.did_mode_set)
+-    meta_onscreen_native_swap_drm_fb (onscreen);
++      /*
++       * If we didn't queue a page flip, but instead directly changed the mode
++       * due to the driver not supporting mode setting, we must swap the
++       * buffers directly as we won't get a page flip callback.
++       */
++      if (!data.did_flip && data.did_mode_set)
++        meta_onscreen_native_swap_drm_fb (onscreen);
++    }
++  else
++    {
++      queue_dummy_power_save_page_flip (renderer_native, flip_closure);
++    }
+ 
+   onscreen_native->pending_queue_swap_notify = TRUE;
+ 
+@@ -2401,11 +2441,14 @@ meta_onscreen_native_swap_buffers_with_damage (CoglOnscreen *onscreen,
+   CoglRendererEGL *cogl_renderer_egl = cogl_renderer->winsys;
+   MetaRendererNativeGpuData *renderer_gpu_data = cogl_renderer_egl->platform;
+   MetaRendererNative *renderer_native = renderer_gpu_data->renderer_native;
++  MetaMonitorManager *monitor_manager =
++    META_MONITOR_MANAGER (renderer_native->monitor_manager_kms);
+   CoglOnscreenEGL *onscreen_egl = onscreen->winsys;
+   MetaOnscreenNative *onscreen_native = onscreen_egl->platform;
+   MetaGpuKms *render_gpu = onscreen_native->render_gpu;
+   CoglFrameInfo *frame_info;
+   gboolean egl_context_changed = FALSE;
++  MetaPowerSave power_save_mode;
+ 
+   /*
+    * Wait for the flip callback before continuing, as we might have started the
+@@ -2447,7 +2490,10 @@ meta_onscreen_native_swap_buffers_with_damage (CoglOnscreen *onscreen,
+ 
+   /* If this is the first framebuffer to be presented then we now setup the
+    * crtc modes, else we flip from the previous buffer */
+-  if (onscreen_native->pending_set_crtc)
++
++  power_save_mode = meta_monitor_manager_get_power_save_mode (monitor_manager);
++  if (onscreen_native->pending_set_crtc &&
++      power_save_mode == META_POWER_SAVE_ON)
+     {
+       meta_onscreen_native_set_crtc_modes (onscreen);
+       onscreen_native->pending_set_crtc = FALSE;
+@@ -4157,6 +4203,13 @@ meta_renderer_native_finalize (GObject *object)
+ {
+   MetaRendererNative *renderer_native = META_RENDERER_NATIVE (object);
+ 
++  if (renderer_native->power_save_page_flip_closures)
++    {
++      g_list_free_full (renderer_native->power_save_page_flip_closures,
++                        (GDestroyNotify) g_closure_unref);
++      g_source_remove (renderer_native->power_save_page_flip_source_id);
++    }
++
+   g_hash_table_destroy (renderer_native->gpu_datas);
+   g_clear_object (&renderer_native->gles3);
+ 
+-- 
+2.18.1
+
+
+From 1eec28b82123d17620b5dda8194d8cafa55683d2 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Fri, 29 Mar 2019 20:54:57 +0100
+Subject: [PATCH 5/6] backend: Add API to freeze/thaw frame clock
+
+It's just a thin wrapper around the ClutterStage API, with the intention
+to hide the awkward nest of interdependent backends.
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/meta-backend-private.h |  4 ++++
+ src/backends/meta-backend.c         | 18 ++++++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/src/backends/meta-backend-private.h b/src/backends/meta-backend-private.h
+index 510e6aa34..7eba1806b 100644
+--- a/src/backends/meta-backend-private.h
++++ b/src/backends/meta-backend-private.h
+@@ -147,6 +147,10 @@ xkb_layout_index_t meta_backend_get_keymap_layout_group (MetaBackend *backend);
+ 
+ gboolean meta_backend_is_lid_closed (MetaBackend *backend);
+ 
++void meta_backend_freeze_updates (MetaBackend *backend);
++
++void meta_backend_thaw_updates (MetaBackend *backend);
++
+ void meta_backend_update_last_device (MetaBackend *backend,
+                                       int          device_id);
+ 
+diff --git a/src/backends/meta-backend.c b/src/backends/meta-backend.c
+index 58eec8c94..23ab2faec 100644
+--- a/src/backends/meta-backend.c
++++ b/src/backends/meta-backend.c
+@@ -1079,6 +1079,24 @@ meta_backend_get_stage (MetaBackend *backend)
+   return priv->stage;
+ }
+ 
++void
++meta_backend_freeze_updates (MetaBackend *backend)
++{
++  ClutterStage *stage;
++
++  stage = CLUTTER_STAGE (meta_backend_get_stage (backend));
++  clutter_stage_freeze_updates (stage);
++}
++
++void
++meta_backend_thaw_updates (MetaBackend *backend)
++{
++  ClutterStage *stage;
++
++  stage = CLUTTER_STAGE (meta_backend_get_stage (backend));
++  clutter_stage_thaw_updates (stage);
++}
++
+ static gboolean
+ update_last_device (MetaBackend *backend)
+ {
+-- 
+2.18.1
+
+
+From 0a4fea117e642134e82c48fafebd972bb724733f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Jonas=20=C3=85dahl?= <jadahl@gmail.com>
+Date: Fri, 29 Mar 2019 20:56:57 +0100
+Subject: [PATCH 6/6] renderer-native: Freeze frames while retrying to page
+ flip
+
+We're currently always waiting for unfinished page flips before flipping
+again. This is awkward when we are in an asynchronous retry-page-flip
+loop, as we can synchronously wait for any KMS page flip event.
+
+To avoid ending up with such situations, just freeze the frame clock
+while we're retrying, then thaw it when we succeded.
+
+https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
+---
+ src/backends/native/meta-renderer-native.c | 31 ++++++++++++++++++----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/src/backends/native/meta-renderer-native.c b/src/backends/native/meta-renderer-native.c
+index 0f0992cbf..b99bc46bc 100644
+--- a/src/backends/native/meta-renderer-native.c
++++ b/src/backends/native/meta-renderer-native.c
+@@ -258,6 +258,15 @@ cogl_pixel_format_from_drm_format (uint32_t               drm_format,
+                                    CoglPixelFormat       *out_format,
+                                    CoglTextureComponents *out_components);
+ 
++static MetaBackend *
++backend_from_renderer_native (MetaRendererNative *renderer_native)
++{
++  MetaMonitorManager *monitor_manager =
++    META_MONITOR_MANAGER (renderer_native->monitor_manager_kms);
++
++  return meta_monitor_manager_get_backend (monitor_manager);
++}
++
+ static void
+ meta_renderer_native_gpu_data_free (MetaRendererNativeGpuData *renderer_gpu_data)
+ {
+@@ -1694,6 +1703,9 @@ retry_page_flips (gpointer user_data)
+     }
+   else
+     {
++      MetaBackend *backend = backend_from_renderer_native (renderer_native);
++
++      meta_backend_thaw_updates (backend);
+       g_clear_pointer (&onscreen_native->retry_page_flips_source,
+                        g_source_unref);
+       return G_SOURCE_REMOVE;
+@@ -1734,6 +1746,8 @@ schedule_retry_page_flip (MetaOnscreenNative *onscreen_native,
+ 
+   if (!onscreen_native->retry_page_flips_source)
+     {
++      MetaBackend *backend =
++        backend_from_renderer_native (onscreen_native->renderer_native);
+       GSource *source;
+ 
+       source = g_source_new (&retry_page_flips_source_funcs, sizeof (GSource));
+@@ -1742,6 +1756,7 @@ schedule_retry_page_flip (MetaOnscreenNative *onscreen_native,
+       g_source_attach (source, NULL);
+ 
+       onscreen_native->retry_page_flips_source = source;
++      meta_backend_freeze_updates (backend);
+     }
+   else
+     {
+@@ -3039,8 +3054,16 @@ meta_renderer_native_release_onscreen (CoglOnscreen *onscreen)
+ 
+   g_list_free_full (onscreen_native->pending_page_flip_retries,
+                     (GDestroyNotify) retry_page_flip_data_free);
+-  g_clear_pointer (&onscreen_native->retry_page_flips_source,
+-                   g_source_destroy);
++  if (onscreen_native->retry_page_flips_source)
++    {
++      MetaBackend *backend =
++        backend_from_renderer_native (onscreen_native->renderer_native);
++
++      meta_backend_thaw_updates (backend);
++      g_clear_pointer (&onscreen_native->retry_page_flips_source,
++                       g_source_destroy);
++    }
++
+ 
+   if (onscreen_egl->egl_surface != EGL_NO_SURFACE)
+     {
+@@ -3363,9 +3386,7 @@ calculate_view_transform (MetaMonitorManager *monitor_manager,
+ static CoglContext *
+ cogl_context_from_renderer_native (MetaRendererNative *renderer_native)
+ {
+-  MetaMonitorManager *monitor_manager =
+-    META_MONITOR_MANAGER (renderer_native->monitor_manager_kms);
+-  MetaBackend *backend = meta_monitor_manager_get_backend (monitor_manager);
++  MetaBackend *backend = backend_from_renderer_native (renderer_native);
+   ClutterBackend *clutter_backend = meta_backend_get_clutter_backend (backend);
+ 
+   return clutter_backend_get_cogl_context (clutter_backend);
+-- 
+2.18.1
+

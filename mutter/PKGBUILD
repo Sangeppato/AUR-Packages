@@ -2,8 +2,6 @@
 # Maintainer: Ionut Biru <ibiru@archlinux.org>
 # Contributor: Michael Kanis <mkanis_at_gmx_dot_de>
 
-# Credit to Tim Summerer
-
 pkgname=mutter
 pkgver=3.32.0+38+g9d49e8abd
 pkgrel=1
@@ -17,11 +15,13 @@ depends=(dconf gobject-introspection-runtime gsettings-desktop-schemas libcanber
 makedepends=(gobject-introspection git egl-wayland meson xorg-server)
 checkdepends=(xorg-server-xvfb)
 groups=(gnome)
-_commit=5199c7834dad039917037cd3797079209b1841de  # master
+_commit=72aeeb8c378836f7eb6132bafe83354eb6a8963a  # master
 source=("git+https://gitlab.gnome.org/GNOME/mutter.git#commit=$_commit"
+        506.patch
         0001-wayland-output-Report-unscaled-size-even-in-logical-.patch
         216.patch)
 sha256sums=('SKIP'
+            'SKIP'
             '842162bf8cec5d69fdb80c85fd152ddd3db6a9179d11d6f81d486f79814838c0'
             'ed4f3cf738a3cffdf8a6e1a352bf24d74078c3b26fb9262c5746e0d95b9df756')
 
@@ -34,11 +34,7 @@ prepare() {
   cd $pkgname
 
   # https://gitlab.gnome.org/GNOME/mutter/merge_requests/506
-  git fetch https://gitlab.gnome.org/jadahl/mutter.git wip/kms-power-save-race
-  git checkout -b jadahl/mutter-wip/kms-power-save-race FETCH_HEAD
-  git fetch origin
-  git checkout origin/master
-  git merge --no-ff jadahl/mutter-wip/kms-power-save-race
+  git apply -3 ../506.patch
 
   # https://bugzilla.mozilla.org/show_bug.cgi?id=1534089
   patch -Np1 -i ../0001-wayland-output-Report-unscaled-size-even-in-logical-.patch
