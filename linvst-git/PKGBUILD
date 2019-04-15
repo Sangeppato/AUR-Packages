@@ -1,0 +1,39 @@
+pkgname=linvst-git
+pkgver=2.4.r13.380c3b8
+pkgrel=1
+provides=('linvst')
+conflicts=('linvst' 'linvst-stable')
+pkgdesc="Bridge that allows Windows vst's to be used as Linux vst's in Linux vst capable DAW's"
+url="https://github.com/osxmidi/LinVst"
+arch=('x86_64')
+license=('GPL')
+depends=('wine' 'gtk3')
+makedepends=('git')
+install="linvst-git.install"
+
+_pkgname=LinVst
+
+source=('git+https://github.com/osxmidi/LinVst.git')
+sha256sums=('SKIP')
+
+
+pkgver() {
+	cd "${_pkgname}"
+	printf "%s" "$(git describe --tags | sed 's/\([^-]*-\)g/r\1/;s/-/./g')"
+}
+
+build() {
+	cd "${srcdir}/${_pkgname}"
+	make -f Makefile-embed-6432 DESTDIR="${pkgdir}" all
+	cd "convert"
+	bash makegtk3
+	bash makegtk3tree
+}
+
+package() {
+	cd "${srcdir}/${_pkgname}"
+	make -f Makefile-embed-6432 DESTDIR="${pkgdir}" VST_DIR="${pkgdir}/usr/share/linvst"  install
+	install -m 755 "convert/linvstconvert" "${pkgdir}/usr/bin/"
+	install -m 755 "convert/linvstconverttree" "${pkgdir}/usr/bin/"
+	install -m 755 "convert/pylinvstconvert" "${pkgdir}/usr/bin/"
+}
